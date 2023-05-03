@@ -209,6 +209,61 @@ def fixPrivateResources(baseapkdir):
         verbosePrint("[+] Updated " + str(updated) + " private resources before building APK.")
 
 ####################
+# Count how many lines start with ".method " in all descendant files
+####################
+def countDescendantFileMethodLines(root):
+    count = 0
+    for (path, dirs, files) in os.walk(root):
+        for file in files:
+            with open(os.path.join(path, file)) as f:
+                for line in f.readlines():
+                    if line.startswith('.method '):
+                        count += 1
+    return count
+
+####################
+# Extract smali classes index from path
+####################
+def extractSmaliClassesIndexFromPath(path):
+    dirName = os.path.split(path)[1]
+    if dirName == 'smali':
+        return 1
+    reMatch = re.match(r'^smali_classes([1-9]\d+|[2-9])$', dirName)
+    return 0 if reMatch is None else int(reMatch.group(1))
+
+####################
+# Ensure smali classes do not hit ushort dex method limit
+####################
+def fixOversizedSmaliClassMethods(baseapkdir):
+    verbosePrint("[+] Fixing oversized smali classes")
+    re_validSmaliDir = re.compile(r'^smali(?:$|_classes(?:[1-9]\d+|[2-9])$)')
+    smali = []
+    oversizedSmali = []
+    for (path, dirs, files) in os.walk(baseapkdir):
+        if path == baseapkdir: # optimization
+            dirs = [dir for dir in dirs if re_validSmaliDir.match(dir)]
+        else:
+            if not re_validSmaliDir.match(os.path.split(path)[1]):
+                continue
+            smali.append(path)
+            subdirs = sorted([(os.path.join(path, dir), countDescendantFileMethodLines(os.path.join(path, dir))) for dir in dirs], key=lambda e: e[1])
+            totalMethodLines = sum(map(lambda e: e[1], subdirs))
+            while totalMethodLines >= 60000:
+                (dirPath, methodLines) = subdirs.pop()
+                totalMethodLines -= methodLines
+                oversizedSmali.append(dirPath)
+    count = len(oversizedSmali)
+    if count == 0:
+        return
+    start = max(map(extractSmaliClassesIndexFromPath, smali))
+    for i in range(count):
+        oversizedSmaliPath = oversizedSmali[i]
+        (oversizedSmaliDir, oversizedSmaliClass) = os.path.split(oversizedSmaliPath)
+        newSmaliDir = 'smali_classes' + str(start + i + 1)
+        shutil.move(oversizedSmaliPath, os.path.join(baseapkdir, newSmaliDir, oversizedSmaliClass))
+        dbgPrint("[+] Moved " + os.path.split(oversizedSmaliDir)[1] + '/' + oversizedSmaliClass + " into new " + newSmaliDir)
+
+####################
 # Build the APK
 ####################
 def build(baseapkdir):
@@ -371,6 +426,9 @@ def combineSplitAPKs(pkgname, localapks, tmppath, disableStylesHack, ignoreSplit
     # Walk the extracted APK directories and copy files and directories to the base APK
     print("\n[+] Rebuilding as a single APK")
     copySplitApkFiles(baseapkdir, splitapkpaths)
+
+    # Fix too many dex methods within a smali classes directory (>USHORT_MAX)
+    fixOversizedSmaliClassMethods(baseapkdir) # https://github.com/JesusFreke/smali/issues/268 (apktool wontfix)
     
     # Fix public resource identifiers
     fixPublicResourceIDs(baseapkdir, splitapkpaths)
