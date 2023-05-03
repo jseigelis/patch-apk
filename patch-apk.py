@@ -38,7 +38,7 @@ def main():
     # Create a temp directory to work from
     with tempfile.TemporaryDirectory() as tmppath:
         # Get the APK to patch. Combine app bundles/split APKs into a single APK.
-        apkfile = getTargetAPK(pkgname, apkpaths, tmppath, args.disable_styles_hack, args.extract_only)
+        apkfile = getTargetAPK(pkgname, apkpaths, tmppath, args.disable_styles_hack, args.ignore_split_failures, args.dump_combined)
         
         # Save the APK if requested
         if args.save_apk is not None or args.extract_only:
@@ -124,9 +124,11 @@ def getArgs():
             description="patch-apk - Pull and patch Android apps for use with objection/frida. Supports split APKs."
         )
         parser.add_argument("--no-enable-user-certs", help="Prevent patch-apk from enabling user-installed certificate support via network security config in the patched APK.", action="store_true")
+        parser.add_argument("--dump-combined", help="Dump the combined, disassembled app bundle (split APK) — if applicable — to the specified path before it is rebuilt as a single APK. This will be treated as a directory.", action="store_true")
         parser.add_argument("--save-apk", help="Save a copy of the APK (or single APK) prior to patching for use with other tools. APK will be saved under the given name.")
         parser.add_argument("--extract-only", help="Disable including objection and pushing modified APK to device.", action="store_true")
         parser.add_argument("--disable-styles-hack", help="Disable the styles hack that removes duplicate entries from res/values/styles.xml.", action="store_true")
+        parser.add_argument("--ignore-split-failures", help="Ignore failures to disassemble split APKs (not the main APK).", action="store_true")
         parser.add_argument("--debug-output", help="Enable debug output.", action="store_true")
         parser.add_argument("-v", "--verbose", help="Enable verbose output.", action="store_true")
         parser.add_argument("pkgname", help="The name, or partial name, of the package to patch (e.g. com.foo.bar).")
@@ -197,11 +199,12 @@ def runApkTool(params):
 def fixPrivateResources(baseapkdir):
     verbosePrint("[+] Forcing all private resources to be public")
     updated = 0
-    for (root, dirs, files) in os.walk(os.path.join(baseapkdir, "res")):
+    for (path, dirs, files) in os.walk(os.path.join(baseapkdir, "res")):
         for f in files:
-            if f.lower().endswith(".xml"):
-                rawREReplace(os.path.join(root, f), '@android', '@*android')
-                updated += 1
+            if not f.lower().endswith(".xml"):
+                continue
+            rawREReplace(os.path.join(path, f), '@android', '@*android')
+            updated += 1
     if updated > 0:
         verbosePrint("[+] Updated " + str(updated) + " private resources before building APK.")
 
@@ -299,7 +302,7 @@ def getAPKPathsForPackage(pkgname):
 # Pull the APK file(s) for the package and return the local file path to work with.
 # If the package is an app bundle/split APK, combine the APKs into a single APK.
 ####################
-def getTargetAPK(pkgname, apkpaths, tmppath, disableStylesHack, extract_only):
+def getTargetAPK(pkgname, apkpaths, tmppath, disableStylesHack, ignoreSplitFailures, dumpCombined):
     # Pull the APKs from the device
     print("")
     bar = Bar('[+] Pulling APK file(s) from device', max=len(apkpaths))
@@ -322,7 +325,7 @@ def getTargetAPK(pkgname, apkpaths, tmppath, disableStylesHack, extract_only):
         return localapks[0]
     else:
         # Combine split APKs
-        return combineSplitAPKs(pkgname, localapks, tmppath, disableStylesHack, extract_only)
+        return combineSplitAPKs(pkgname, localapks, tmppath, disableStylesHack, ignoreSplitFailures, dumpCombined)
 
 def verbosePrint(msg):
     if getArgs().verbose:
@@ -332,7 +335,7 @@ def verbosePrint(msg):
 ####################
 # Combine app bundles/split APKs into a single APK for patching.
 ####################
-def combineSplitAPKs(pkgname, localapks, tmppath, disableStylesHack, extract_only):
+def combineSplitAPKs(pkgname, localapks, tmppath, disableStylesHack, ignoreSplitFailures, dumpCombined):
     warningPrint("\n[!] App bundle/split APK detected, rebuilding as a single APK.")
     
     # Extract the individual APKs
@@ -345,15 +348,16 @@ def combineSplitAPKs(pkgname, localapks, tmppath, disableStylesHack, extract_onl
     verboseOutput = ""
     
     for apkpath in localapks:
-        verboseOutput += "\nExtracted: " + apkpath
+        isBaseApk = apkpath.endswith("base.apk")
+        verboseOutput += "\nExtracted" + (" (base): " if isBaseApk else ": ") + apkpath
         bar.next()
         apkdir = apkpath[:-4]
         ret = runApkTool(["d", apkpath, "-o", apkdir])
-        if ret.returncode != 0:
-            abort("\nError: Failed to run 'apktool d " + apkpath + " -o " + apkdir + "'.\nRun with --debug-output for more information.")
+        if ret.returncode != 0 and (isBaseApk or not ignoreSplitFailures): # ignoreSplitFailures is ugly hack trying to work around https://github.com/iBotPeaches/Apktool/issues/2701
+            abort("\nError: Failed to disassemble APK @ " + apkpath + " with target output " + apkdir + ".\nRun with --debug-output for more information.")
         
         # Record the destination paths of all but the base APK
-        if not apkpath.endswith("base.apk"):
+        if not isBaseApk:
             splitapkpaths.append(apkdir)
         
         # Check for ProGuard/AndResGuard - this might b0rk decompile/recompile
@@ -383,6 +387,8 @@ def combineSplitAPKs(pkgname, localapks, tmppath, disableStylesHack, extract_onl
     rawREReplace(os.path.join(baseapkdir, "res", "values", "strings.xml"), r'(&amp)([^;])', r'\1;\2')
     
     # Rebuild the base APK
+    if dumpCombined:
+      shutil.copytree(baseapkdir, dumpCombined)
     build(baseapkdir)
     
     # Return the new APK path
@@ -409,31 +415,32 @@ def detectProGuard(extractedPath):
 ####################
 def copySplitApkFiles(baseapkdir, splitapkpaths):
     for apkdir in splitapkpaths:
-        for (root, dirs, files) in os.walk(apkdir):
+        for (path, dirs, files) in os.walk(apkdir):
             # Skip the original files directory
-            if not root.startswith(os.path.join(apkdir, "original")):
-                # Create any missing directories
-                for d in dirs:
-                    # Translate directory path to base APK path and create the directory if it doesn't exist
-                    p = baseapkdir + os.path.join(root, d)[len(apkdir):]
-                    if not os.path.exists(p):
-                        dbgPrint("[+] Creating directory in base APK: " + p[len(baseapkdir):])
-                        os.mkdir(p)
+            if path.startswith(os.path.join(apkdir, "original")):
+                continue
+            # Create any missing directories
+            for d in dirs:
+                # Translate directory path to base APK path and create the directory if it doesn't exist
+                p = baseapkdir + os.path.join(path, d)[len(apkdir):]
+                if not os.path.exists(p):
+                    dbgPrint("[+] Creating directory in base APK: " + p[len(baseapkdir):])
+                    os.mkdir(p)
+            
+            # Copy files into the base APK
+            for f in files:
+                # Skip the AndroidManifest.xml and apktool.yml in the APK root directory
+                if apkdir == path and (f == "AndroidManifest.xml" or f == "apktool.yml"):
+                    continue
                 
-                # Copy files into the base APK
-                for f in files:
-                    # Skip the AndroidManifest.xml and apktool.yml in the APK root directory
-                    if apkdir == root and (f == "AndroidManifest.xml" or f == "apktool.yml"):
-                        continue
-                    
-                    # Translate path to base APK
-                    p = baseapkdir + os.path.join(root, f)[len(apkdir):]
-                    
-                    # Copy files into the base APK, except for XML files in the res directory
-                    if f.lower().endswith(".xml") and p.startswith(os.path.join(baseapkdir, "res")):
-                        continue
-                    dbgPrint("[+] Moving file to base APK: " + p[len(baseapkdir):])
-                    shutil.move(os.path.join(root, f), p)
+                # Translate path to base APK
+                p = baseapkdir + os.path.join(path, f)[len(apkdir):]
+                
+                # Copy files into the base APK, except for XML files in the res directory
+                if f.lower().endswith(".xml") and p.startswith(os.path.join(baseapkdir, "res")):
+                    continue
+                dbgPrint("[+] Moving file to base APK: " + p[len(baseapkdir):])
+                shutil.move(os.path.join(path, f), p)
 
 ####################
 # Fix public resource identifiers that are shared across split APKs.
@@ -456,10 +463,11 @@ def fixPublicResourceIDs(baseapkdir, splitapkpaths):
     #         the split APKs in step 2 below.
     baseXmlTree = xml.etree.ElementTree.parse(os.path.join(baseapkdir, "res", "values", "public.xml"))
     for el in baseXmlTree.getroot():
-        if "name" in el.attrib and "id" in el.attrib:
-            if el.attrib["name"].startswith("APKTOOL_DUMMY_") and el.attrib["name"] not in idToDummyName:
-                idToDummyName[el.attrib["id"]] = el.attrib["name"]
-                dummyNameToRealName[el.attrib["name"]] = None
+        if "name" not in el.attrib or "id" not in el.attrib:
+            continue
+        if el.attrib["name"].startswith("APKTOOL_DUMMY_") and el.attrib["name"] not in idToDummyName:
+            idToDummyName[el.attrib["id"]] = el.attrib["name"]
+            dummyNameToRealName[el.attrib["name"]] = None
     verbosePrint("[+] Resolving " + str(len(idToDummyName)) + " resource identifiers.")
     
     # Step 2) Parse the public.xml file from each split APK in search of resource IDs matching
@@ -468,81 +476,85 @@ def fixPublicResourceIDs(baseapkdir, splitapkpaths):
     #         the base APK.
     found = 0
     for splitdir in splitapkpaths:
-        if os.path.exists(os.path.join(splitdir, "res", "values", "public.xml")):
-            tree = xml.etree.ElementTree.parse(os.path.join(splitdir, "res", "values", "public.xml"))
-            for el in tree.getroot():
-                if "name" in el.attrib and "id" in el.attrib:
-                    if el.attrib["id"] in idToDummyName:
-                        dummyNameToRealName[idToDummyName[el.attrib["id"]]] = el.attrib["name"]
-                        found += 1
+        if not os.path.exists(os.path.join(splitdir, "res", "values", "public.xml")):
+            continue
+        tree = xml.etree.ElementTree.parse(os.path.join(splitdir, "res", "values", "public.xml"))
+        for el in tree.getroot():
+            if "name" not in el.attrib or "id" not in el.attrib:
+                continue
+            if el.attrib["id"] in idToDummyName:
+                dummyNameToRealName[idToDummyName[el.attrib["id"]]] = el.attrib["name"]
+                found += 1
     verbosePrint("[+] Located " + str(found) + " true resource names.")
     
     # Step 3) Update the base APK to replace all APKTOOL_DUMMY_XXX resource names with the true
     #         resource name.
     updated = 0
     for el in baseXmlTree.getroot():
-        if "name" in el.attrib and "id" in el.attrib:
-            if el.attrib["name"] in dummyNameToRealName and dummyNameToRealName[el.attrib["name"]] is not None:
-                el.attrib["name"] = dummyNameToRealName[el.attrib["name"]]
-                updated += 1
+        if "name" not in el.attrib or "id" not in el.attrib:
+            continue
+        if el.attrib["name"] in dummyNameToRealName and dummyNameToRealName[el.attrib["name"]] is not None:
+            el.attrib["name"] = dummyNameToRealName[el.attrib["name"]]
+            updated += 1
     baseXmlTree.write(os.path.join(baseapkdir, "res", "values", "public.xml"), encoding="utf-8", xml_declaration=True)
     verbosePrint("[+] Updated " + str(updated) + " dummy resource names with true names in the base APK.")
     
     # Step 4) Find all references to APKTOOL_DUMMY_XXX resources within other XML resource files
     #         in the base APK and update them to refer to the true resource name.
     updated = 0
-    for (root, dirs, files) in os.walk(os.path.join(baseapkdir, "res")):
+    for (path, dirs, files) in os.walk(os.path.join(baseapkdir, "res")):
         for f in files:
-            if f.lower().endswith(".xml"):
-                try:
-                    # Load the XML
-                    xmlPath = os.path.join(root, f)
-                    dbgPrint("[~] Parsing " + xmlPath)
-                    tree = xml.etree.ElementTree.parse(xmlPath)
-                    
-                    # Register the namespaces and get the prefix for the "android" namespace
-                    namespaces = dict([node for _,node in xml.etree.ElementTree.iterparse(os.path.join(baseapkdir, "AndroidManifest.xml"), events=["start-ns"])])
-                    for ns in namespaces:
-                        xml.etree.ElementTree.register_namespace(ns, namespaces[ns])
-                    ns = "{" + namespaces["android"] + "}"
-                    
-                    # Update references to APKTOOL_DUMMY_XXX resources
-                    changed = False
-                    for el in tree.iter():
-                        # Check for references to APKTOOL_DUMMY_XXX resources in attributes of this element
-                        for attr in el.attrib:
-                            val = el.attrib[attr]
-                            if val.startswith("@") and "/" in val and val.split("/")[1].startswith("APKTOOL_DUMMY_") and dummyNameToRealName[val.split("/")[1]] is not None:
-                                el.attrib[attr] = val.split("/")[0] + "/" + dummyNameToRealName[val.split("/")[1]]
-                                updated += 1
-                                changed = True
-                            elif val.startswith("APKTOOL_DUMMY_") and dummyNameToRealName[val] is not None:
-                                el.attrib[attr] = dummyNameToRealName[val]
-                                updated += 1
-                                changed = True
-                            
-                            if changed:
-                                dbgPrint("[~] Patching dummy apktool attribute \"" + attr + "\" value \"" + val + "\"" + (" -> \"" + el.attrib[attr] + "\"" if val != el.attrib[attr] else "") + " (" + str(updated) + ")")
-                            
-                            # Fix for untracked bug where drawables are decoded without drawable values (@null)
-                            if f == "drawables.xml" and attr == "name" and el.text is None:
-                                dbgPrint("[~] Patching null decoded drawable \"" + el.attrib[attr] + "\" (" + str(updated) + ")")
-                                el.text = NULL_DECODED_DRAWABLE_COLOR
-                        
-                        # Check for references to APKTOOL_DUMMY_XXX resources in the element text
-                        val = el.text
-                        if val is not None and val.startswith("@") and "/" in val and val.split("/")[1].startswith("APKTOOL_DUMMY_") and dummyNameToRealName[val.split("/")[1]] is not None:
-                            el.text = val.split("/")[0] + "/" + dummyNameToRealName[val.split("/")[1]]
+            if not f.lower().endswith(".xml"):
+                continue
+            try:
+                # Load the XML
+                xmlPath = os.path.join(path, f)
+                dbgPrint("[~] Parsing " + xmlPath)
+                tree = xml.etree.ElementTree.parse(xmlPath)
+                
+                # Register the namespaces and get the prefix for the "android" namespace
+                namespaces = dict([node for _,node in xml.etree.ElementTree.iterparse(os.path.join(baseapkdir, "AndroidManifest.xml"), events=["start-ns"])])
+                for ns in namespaces:
+                    xml.etree.ElementTree.register_namespace(ns, namespaces[ns])
+                ns = "{" + namespaces["android"] + "}"
+                
+                # Update references to APKTOOL_DUMMY_XXX resources
+                changed = False
+                for el in tree.iter():
+                    # Check for references to APKTOOL_DUMMY_XXX resources in attributes of this element
+                    for attr in el.attrib:
+                        val = el.attrib[attr]
+                        if val.startswith("@") and "/" in val and val.split("/")[1].startswith("APKTOOL_DUMMY_") and dummyNameToRealName[val.split("/")[1]] is not None:
+                            el.attrib[attr] = val.split("/")[0] + "/" + dummyNameToRealName[val.split("/")[1]]
                             updated += 1
                             changed = True
-                            dbgPrint("[~] Patching dummy apktool element \"" + el.get('name', el.tag) + "\" value \"" + val + (" -> \"" + el.text + "\"" if val != el.text else "") + str(updated) + ")")
+                        elif val.startswith("APKTOOL_DUMMY_") and dummyNameToRealName[val] is not None:
+                            el.attrib[attr] = dummyNameToRealName[val]
+                            updated += 1
+                            changed = True
+                        
+                        if changed:
+                            dbgPrint("[~] Patching dummy apktool attribute \"" + attr + "\" value \"" + val + "\"" + (" -> \"" + el.attrib[attr] + "\"" if val != el.attrib[attr] else "") + " (" + str(updated) + ")")
+                        
+                        # Fix for untracked bug where drawables are decoded without drawable values (@null)
+                        if f == "drawables.xml" and attr == "name" and el.text is None:
+                            dbgPrint("[~] Patching null decoded drawable \"" + el.attrib[attr] + "\" (" + str(updated) + ")")
+                            el.text = NULL_DECODED_DRAWABLE_COLOR
                     
-                    # Save the file if it was updated
-                    if changed:
-                        dbgPrint("[+] Writing patched " + f)
-                        tree.write(os.path.join(root, f), encoding="utf-8", xml_declaration=True)
-                except xml.etree.ElementTree.ParseError:
-                    print("[-] XML parse error in " + os.path.join(root, f) + ", skipping.")
+                    # Check for references to APKTOOL_DUMMY_XXX resources in the element text
+                    val = el.text
+                    if val is not None and val.startswith("@") and "/" in val and val.split("/")[1].startswith("APKTOOL_DUMMY_") and dummyNameToRealName[val.split("/")[1]] is not None:
+                        el.text = val.split("/")[0] + "/" + dummyNameToRealName[val.split("/")[1]]
+                        updated += 1
+                        changed = True
+                        dbgPrint("[~] Patching dummy apktool element \"" + el.get('name', el.tag) + "\" value \"" + val + (" -> \"" + el.text + "\"" if val != el.text else "") + str(updated) + ")")
+                
+                # Save the file if it was updated
+                if changed:
+                    dbgPrint("[+] Writing patched " + f)
+                    tree.write(os.path.join(path, f), encoding="utf-8", xml_declaration=True)
+            except xml.etree.ElementTree.ParseError:
+                print("[-] XML parse error in " + os.path.join(path, f) + ", skipping.")
     verbosePrint("[+] Updated " + str(updated) + " references to dummy resource names in the base APK.")
 
 ####################
