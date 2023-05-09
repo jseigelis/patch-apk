@@ -124,7 +124,7 @@ def getArgs():
             description="patch-apk - Pull and patch Android apps for use with objection/frida. Supports split APKs."
         )
         parser.add_argument("--no-enable-user-certs", help="Prevent patch-apk from enabling user-installed certificate support via network security config in the patched APK.", action="store_true")
-        parser.add_argument("--dump-combined", help="Dump the combined, disassembled app bundle (split APK) — if applicable — to the specified path before it is rebuilt as a single APK. This will be treated as a directory.", action="store_true")
+        parser.add_argument("--dump-combined", help="Dump the combined, disassembled app bundle (split APK) — if applicable — to the specified directory before it is rebuilt as a single APK.", action="store_true")
         parser.add_argument("--save-apk", help="Save a copy of the APK (or single APK) prior to patching for use with other tools. APK will be saved under the given name.")
         parser.add_argument("--extract-only", help="Disable including objection and pushing modified APK to device.", action="store_true")
         parser.add_argument("--disable-styles-hack", help="Disable the styles hack that removes duplicate entries from res/values/styles.xml.", action="store_true")
